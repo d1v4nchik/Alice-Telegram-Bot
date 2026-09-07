@@ -33,9 +33,13 @@ class GameSession:
     ended: bool = False
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    paused_seconds: float = 0.0
+    pause_started_at: Optional[datetime] = None
+    timer_paused: bool = False
     lobby_msg_id: Optional[int] = None
     lobby_pinned: bool = False
     sus_points: dict = field(default_factory=dict)
+    use_assets: bool = True
     player_tasks: dict = field(default_factory=dict)
     trigger_task: object = None
     reminder_task: object = None
@@ -49,17 +53,28 @@ class GameSession:
     def is_active(self) -> bool:
         return self.started and not self.ended
 
-    def elapsed_minutes(self) -> float:
+    def paused_elapsed_seconds(self) -> float:
+        total = max(0.0, float(self.paused_seconds or 0.0))
+        if self.timer_paused and self.pause_started_at:
+            now = datetime.now(tz=UTC)
+            pst = self.pause_started_at
+            if pst.tzinfo is None:
+                pst = pst.replace(tzinfo=UTC)
+            total += max(0.0, (now - pst).total_seconds())
+        return total
+
+    def elapsed_seconds(self) -> float:
         if not self.start_time or not self.started:
             return 0.0
         now = datetime.now(tz=UTC)
-        # Always compare timezone-aware datetimes
         st = self.start_time
         if st.tzinfo is None:
             st = st.replace(tzinfo=UTC)
-        diff = (now - st).total_seconds()
-        # Guard against clock skew / future start_time
-        return max(0.0, diff / 60.0)
+        raw = max(0.0, (now - st).total_seconds())
+        return max(0.0, raw - self.paused_elapsed_seconds())
+
+    def elapsed_minutes(self) -> float:
+        return self.elapsed_seconds() / 60.0
 
     def remaining_minutes(self) -> float:
         return max(0.0, GAME_DURATION_MINUTES - self.elapsed_minutes())

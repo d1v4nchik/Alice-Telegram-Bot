@@ -76,6 +76,9 @@ bot_halted_by: int | None = getattr(helpers, "bot_halted_by", None)
 helpers.bot_halted = bot_halted
 helpers.bot_halted_by = bot_halted_by
 
+asset_mode_for_user = getattr(helpers, "asset_mode_for_user", lambda uid, default=True: default)
+set_asset_mode_for_user = getattr(helpers, "set_asset_mode_for_user", lambda uid, enabled: None)
+
 def find_session(game_id: str) -> GameSession | None:
     return games.get(game_id)
 
@@ -128,12 +131,13 @@ if group_reminder_loop is None:
 
 if build_lobby_text is None:
     def build_lobby_text(s: GameSession) -> str:
+        host_name = helpers.display_host_name(s)
         if s.is_lobby():
             real_count = sum(1 for uid in s.players if uid >= 0)
             return (
                 f"🎮 <b>Alice Is Missing</b>\n"
                 f"<b>Game ID:</b> <code>{s.game_id}</code>\n"
-                f"<b>Host:</b> {html.escape(s.host_telegram_name)}\n"
+                f"<b>Host:</b> {html.escape(host_name)}\n"
                 f"<b>Status:</b> 🏠 Lobby ({real_count} player(s))\n\n"
                 f"{s.roster_text()}\n\n"
                 f"Tap <b>Join</b> to enter, then DM the bot to set your character name."
@@ -220,6 +224,18 @@ def _session_for_user(uid: int) -> GameSession | None:
     return None
 
 
+def _session_uses_assets(s: GameSession | None) -> bool:
+    return True if s is None else getattr(s, "use_assets", True)
+
+
+def _toggle_asset_mode(uid: int, session: GameSession | None = None) -> bool:
+    enabled = not asset_mode_for_user(uid)
+    set_asset_mode_for_user(uid, enabled)
+    if session is not None:
+        session.use_assets = enabled
+    return enabled
+
+
 def _clear_input_state(uid: int, *, keep: set[str] | None = None) -> None:
     """Drop pending text-input state that would otherwise hijack the next DM."""
     keep = keep or set()
@@ -301,9 +317,9 @@ def _generate_game_id() -> str:
 
 def _guide_text() -> str:
     return (
-        "📖 <b>Alice Is Missing — Custom Game Guide</b>\n\n"
+        "<b>Alice Is Missing — Game Guide</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>🎬 The Story Begins</b>\n\n"
+        "<b>The Story Begins</b>\n\n"
         "It is Saturday, the first day of winter break.\n\n"
         "Alice has been missing since Wednesday — three days now. No one has seen her. No one knows where she is.\n\n"
         "You are people who knew Alice. Over the next 90 minutes, through messages alone, you will uncover what happened.\n\n"
@@ -321,7 +337,7 @@ def _guide_text() -> str:
         "These relationships drive the story.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>🔐 Your Secrets</b>\n\n"
-        "Every character hides multiple truths:\n\n"
+        "Every character has something to hide:\n\n"
         "A shared secret.\n"
         "A secret involving Alice.\n"
         "A darker secret tied to the crime.\n"
@@ -364,17 +380,15 @@ def _guide_text() -> str:
     )
 
 
-async def _send_guide_asset(bot, chat_id: int, *, reply_markup=None) -> None:
+async def _send_guide_asset(bot, chat_id: int, *, use_assets: bool = True, reply_markup=None) -> None:
     """Send the guide image if it is available locally; otherwise fall back to text."""
-    image_path = _first_existing_path(GUIDE_IMAGE_PATHS)
+    image_path = _first_existing_path(GUIDE_IMAGE_PATHS) if use_assets else None
     if image_path:
         try:
             with image_path.open("rb") as photo:
                 await bot.send_photo(
                     chat_id=chat_id,
                     photo=photo,
-                    caption="📖 <b>Alice Is Missing — Game Guide</b>",
-                    parse_mode="HTML",
                     reply_markup=reply_markup,
                 )
                 return
@@ -389,16 +403,23 @@ async def _send_guide_asset(bot, chat_id: int, *, reply_markup=None) -> None:
     )
 
 
-async def _send_oracle_asset(bot, chat_id: int, positive: bool, *, reply_markup=None) -> None:
+async def _send_oracle_asset(
+    bot,
+    chat_id: int,
+    positive: bool,
+    *,
+    use_assets: bool = True,
+    reply_markup=None,
+) -> None:
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     await asyncio.sleep(random.uniform(1.5, 2.5))
 
     if positive:
         answer = _oracle_answer(chat_id, positive=True)
-        image_path = _first_existing_path(ORACLE_POSITIVE_IMAGE_PATHS)
+        image_path = _first_existing_path(ORACLE_POSITIVE_IMAGE_PATHS) if use_assets else None
     else:
         answer = _oracle_answer(chat_id, positive=False)
-        image_path = _first_existing_path(ORACLE_NEGATIVE_IMAGE_PATHS)
+        image_path = _first_existing_path(ORACLE_NEGATIVE_IMAGE_PATHS) if use_assets else None
 
     caption = f"🔮 <i>{html.escape(answer)}</i>"
     if image_path is not None:
@@ -425,9 +446,11 @@ async def _send_oracle_asset(bot, chat_id: int, positive: bool, *, reply_markup=
 
 def _host_tools_text(s: GameSession | None, menu: str) -> str:
     if menu == "game":
+        timer_state = "paused" if s and getattr(s, "timer_paused", False) else "running"
         return (
             "🎮 <b>Game Control</b>\n\n"
-            "Start, end, or stop the current game."
+            "Start, pause, unpause, end, or stop the current game.\n\n"
+            f"Timer state: <b>{timer_state}</b>."
         )
     if menu == "sus":
         if not s:
@@ -443,9 +466,13 @@ def _host_tools_text(s: GameSession | None, menu: str) -> str:
             "Rename characters or add NPCs."
         )
     if menu == "info":
+        asset_mode = "image assets" if _session_uses_assets(s) else "text only"
+        timer_state = "paused" if s and getattr(s, "timer_paused", False) else "running"
         return (
             "📖 <b>Info & Guide</b>\n\n"
-            "Send the guide or character list to the group."
+            "Send the guide or character list to the group.\n\n"
+            f"Current reply mode: <b>{asset_mode}</b>.\n"
+            f"Timer state: <b>{timer_state}</b>."
         )
     return (
         "🔧 <b>Host Tools</b>\n\n"
@@ -590,15 +617,17 @@ def _help_text() -> str:
         "• /name NAME — set or change your character name\n"
         "• /message — send a DM to another player\n"
         "• /seekingcards — draw a random seeking card\n"
-        "• Seeking Cards — reveal a random clue-style result\n"
         "• /fate — ask the oracle a yes/no question\n"
         "• /cancel — cancel the current pending action\n"
         "• /guide — how to play\n\n"
         "<b>Host only</b>\n"
         "• /startgame — start the game\n"
+        "• /pausegame — pause the timer\n"
+        "• /unpausegame — resume the timer\n"
         "• /endgame — end the game\n"
         "• /forcestop — stop the bot and active sessions\n"
         "• /hosttools — open the host tools panel\n"
+        "• /usepic — toggle guide/oracle assets on or off\n"
         "• /sus — award suspicion points\n"
         "• /addnpc — add an NPC\n"
         "• /sendguide — send the guide to the group\n"
@@ -630,7 +659,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "🕵️ <b>Alice Is Missing</b>\n\n"
                 "The bot has been restarted.\n\n"
                 "A silent mystery game for groups.\n\n"
-                "Your host creates a game in your group chat with /newgame.\n"
+                "The group creator creates a game in your group chat with /newgame.\n"
                 "Tap <b>Join</b> when the lobby card appears, then set your character name here in DM.\n\n"
                 "Type /help for all commands.",
                 parse_mode="HTML",
@@ -649,7 +678,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🕵️ <b>Alice Is Missing</b>\n\n"
         "A silent mystery game for groups.\n\n"
-        "Your host creates a game in your group chat with /newgame.\n"
+        "The group creator creates a game in your group chat with /newgame.\n"
         "Tap <b>Join</b> when the lobby card appears, then set your character name here in DM.\n\n"
         "Type /help for all commands.",
         parse_mode="HTML",
@@ -671,11 +700,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_guide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    priv = update.effective_chat.type == "private"
-    s = find_player_session(uid) if priv else None
+    chat = update.effective_chat
+    priv = chat.type == "private"
+    s = find_player_session(uid) if priv else find_session_by_chat(chat.id)
     await _send_guide_asset(
         context.bot,
-        update.effective_chat.id,
+        chat.id,
+        use_assets=asset_mode_for_user(uid),
         reply_markup=get_keyboard(s, uid) if priv else None,
     )
 
@@ -702,16 +733,34 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_usepic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    priv = update.effective_chat.type == "private"
+    s = _session_for_user(uid)
+    kb = get_keyboard(s, uid) if priv else None
+
+    # Only sync the shared session-wide flag when the host toggles it;
+    # otherwise this is just the caller's personal DM preference.
+    session_for_toggle = s if (s is not None and uid == s.host_id) else None
+    enabled = _toggle_asset_mode(uid, session_for_toggle)
+    save_lobby_state()
+    state = "enabled" if enabled else "text only"
+    await update.effective_message.reply_text(
+        f"🖼 Asset replies are now <b>{state}</b>.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
-
-    if bot_halted:
-        await update.message.reply_text(
-            "⛔ The bot is currently stopped.\n"
-            "Use /start in DM to restart it first.",
+    message = update.effective_message
+    if user is None:
+        await message.reply_text(
+            "⚠️ I couldn't identify a real user for that command.\n"
+            "Use `/newgame` from your own account.",
             parse_mode="HTML",
-            reply_markup=get_keyboard(None, user.id),
         )
         return
 
@@ -723,6 +772,38 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        await update.message.reply_text(
+            "⚠️ I couldn't verify who owns this group.\n"
+            "Only the group creator can start a new game here.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(None, user.id),
+        )
+        return
+
+    if getattr(member, "status", "") != "creator":
+        await update.message.reply_text(
+            "⚠️ Only the group creator can start a new game.\n"
+            "The host must be the owner of the group, not an admin or anonymous sender.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(None, user.id),
+        )
+        return
+
+    host_id = user.id
+    host_name = helpers.display_name_for_user(user)
+
+    if bot_halted:
+        await update.message.reply_text(
+            "⛔ The bot is currently stopped.\n"
+            "Use /start in DM to restart it first.",
+            parse_mode="HTML",
+            reply_markup=get_keyboard(None, host_id),
+        )
+        return
+
     existing_group = find_session_by_chat(chat.id)
     if existing_group and not existing_group.ended:
         await update.message.reply_text(
@@ -731,7 +812,7 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    existing = find_player_session(user.id)
+    existing = find_player_session(host_id)
     if existing and not existing.ended:
         await update.message.reply_text(
             f"⚠️ You're already hosting game <code>{existing.game_id}</code>.\n"
@@ -742,17 +823,18 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     session = GameSession(
         game_id=_generate_game_id(),
-        host_id=user.id,
+        host_id=host_id,
         lobby_chat_id=chat.id,
-        host_telegram_name=user.first_name or "Host",
+        host_telegram_name=host_name,
+        use_assets=asset_mode_for_user(host_id),
     )
-    session.players[user.id] = PlayerState(
-        telegram_name=user.first_name or "Host",
-        telegram_id=user.id,
+    session.players[host_id] = PlayerState(
+        telegram_name=host_name,
+        telegram_id=host_id,
         username=user.username or "",
         character_name="Awaiting name",
     )
-    pending_name_for_user[user.id] = session.game_id
+    pending_name_for_user[host_id] = session.game_id
     games[session.game_id] = session
     save_lobby_state()
 
@@ -760,7 +842,7 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🎮 <b>Game created!</b>  <code>{session.game_id}</code>\n\n"
         f"The lobby card is below — players tap <b>Join</b> to enter.\n"
         f"Use /startgame here when everyone is ready.\n\n"
-        f"<b>Host:</b> {html.escape(user.first_name or 'Host')} — "
+        f"<b>Host:</b> {html.escape(host_name)} — "
         f"check your DMs with the bot to set your character name.",
         parse_mode="HTML",
     )
@@ -769,19 +851,24 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         await context.bot.send_message(
-            chat_id=user.id,
+            chat_id=host_id,
             text=(
                 f"👑 You created game <code>{session.game_id}</code>.\n\n"
                 f"Send your <b>character name</b> now to get started.\n"
                 f"Other players will join from the group lobby card."
             ),
             parse_mode="HTML",
-            reply_markup=get_keyboard(session, user.id),
+            reply_markup=get_keyboard(session, host_id),
         )
     except Exception:
         pass
 
-    logger.info("Game %s created by %s (%d)", session.game_id, user.first_name, user.id)
+    logger.info(
+        "Game %s created by %s (%d)",
+        session.game_id,
+        host_name,
+        host_id,
+    )
 
 
 async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -863,18 +950,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if s.is_active():
-        state = f"🟢 Active · {s.game_phase()} phase · {int(s.elapsed_minutes())} min elapsed"
+        timer_state = "paused" if getattr(s, "timer_paused", False) else "running"
+        state = f"🟢 Active · {s.game_phase()} phase · {int(s.elapsed_minutes())} min elapsed · {timer_state}"
     elif s.ended:
         state = "🔴 Ended"
     else:
         state = "🏠 Lobby"
 
     dev = uid in dev_mode_users and uid == s.host_id
+    host_name = helpers.display_host_name(s)
     await update.message.reply_text(
         f"📋 <b>Game Status</b>\n"
         f"<b>ID:</b> <code>{s.game_id}</code>\n"
         f"<b>Status:</b> {state}\n"
-        f"<b>Host:</b> {html.escape(s.host_telegram_name)}\n\n"
+        f"<b>Host:</b> {html.escape(host_name)}\n\n"
         f"{s.roster_text(include_dummies=dev)}",
         parse_mode="HTML",
         reply_markup=kb,
@@ -996,6 +1085,7 @@ async def cmd_fate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.bot,
         update.effective_chat.id,
         positive=secrets.choice((True, False)),
+        use_assets=asset_mode_for_user(uid),
         reply_markup=kb,
     )
 
@@ -1074,7 +1164,7 @@ async def cmd_sendguide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Only the host can send the guide.", reply_markup=kb)
         return
 
-    await _send_guide_asset(context.bot, s.lobby_chat_id)
+    await _send_guide_asset(context.bot, s.lobby_chat_id, use_assets=_session_uses_assets(s))
     await update.message.reply_text("📖 Guide sent to the group.", reply_markup=kb)
 
 
@@ -1194,6 +1284,81 @@ async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ok, err = await _start_game_session(s, context)
     if not ok:
         await update.message.reply_text(f"⚠️ {err}")
+
+
+async def cmd_pausegame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    priv = chat.type == "private"
+    s = _session_for_user(user.id) if priv else find_session_by_chat(chat.id)
+    kb = get_keyboard(s, user.id) if priv else None
+
+    if not s:
+        await update.message.reply_text("No game found.", reply_markup=kb)
+        return
+    if user.id != s.host_id:
+        await update.message.reply_text("Only the host can pause the timer.", reply_markup=kb)
+        return
+    if not s.is_active():
+        await update.message.reply_text("The timer can only be paused during an active game.", reply_markup=kb)
+        return
+    if s.timer_paused:
+        await update.message.reply_text("The timer is already paused.", reply_markup=kb)
+        return
+
+    helpers.pause_game_timer(s)
+    await refresh_group_lobby(context.bot, s)
+    await update.message.reply_text(
+        "⏸ Timer paused.",
+        reply_markup=kb,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=s.lobby_chat_id,
+            text=(
+                "⏸ <b>Timer paused.</b>\n\n"
+                "No more trigger cards or reminders will advance until the host unpauses it."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def cmd_unpausegame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    priv = chat.type == "private"
+    s = _session_for_user(user.id) if priv else find_session_by_chat(chat.id)
+    kb = get_keyboard(s, user.id) if priv else None
+
+    if not s:
+        await update.message.reply_text("No game found.", reply_markup=kb)
+        return
+    if user.id != s.host_id:
+        await update.message.reply_text("Only the host can unpause the timer.", reply_markup=kb)
+        return
+    if not s.is_active():
+        await update.message.reply_text("The timer can only be unpaused during an active game.", reply_markup=kb)
+        return
+    if not s.timer_paused:
+        await update.message.reply_text("The timer is not paused.", reply_markup=kb)
+        return
+
+    helpers.resume_game_timer(s)
+    await refresh_group_lobby(context.bot, s)
+    await update.message.reply_text(
+        "▶️ Timer resumed.",
+        reply_markup=kb,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=s.lobby_chat_id,
+            text="▶️ <b>Timer resumed.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 async def cmd_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1409,7 +1574,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
 
             s.players[user_id] = PlayerState(
-                telegram_name=update.effective_user.first_name or "Player",
+                telegram_name=helpers.display_name_for_user(update.effective_user),
                 telegram_id=user_id,
                 username=update.effective_user.username or "",
             )
@@ -1455,9 +1620,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # ── END GAME ──────────────────────────────────────────────────────
         if data == "game_end":
-            s = find_session_by_chat(query.message.chat_id)
-            if not s:
+            if query.message.chat.type == "private":
                 s = find_player_session(user_id)
+            else:
+                s = find_session_by_chat(query.message.chat_id)
             if not s or user_id != s.host_id:
                 await query.answer("Only the host can end the game.", show_alert=True)
                 return
@@ -1595,9 +1761,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # ── NPC RENAME FROM GROUP ─────────────────────────────────────────
         if data.startswith("npc_rename_grp:"):
             idx = int(data.split(":", 1)[1])
+            # Group-only button — no DM equivalent, so don't fall back to a
+            # different session the presser happens to host elsewhere.
             s = find_session_by_chat(query.message.chat_id)
-            if not s:
-                s = find_player_session(user_id)
             if not s:
                 await query.answer("No game found.", show_alert=True)
                 return
@@ -1628,9 +1794,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # ── ADD NPC FROM GROUP ────────────────────────────────────────────
         if data == "npc_add_grp":
+            # Group-only button — no DM equivalent, so don't fall back to a
+            # different session the presser happens to host elsewhere.
             s = find_session_by_chat(query.message.chat_id)
-            if not s:
-                s = find_player_session(user_id)
             if not s:
                 await query.answer("No game found.", show_alert=True)
                 return
@@ -1726,9 +1892,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # ── HOST RENAME PLAYER (from group char_rename_menu) ──────────────
         if data.startswith("host_rename_pick_grp:"):
             target_uid = int(data.split(":", 1)[1])
+            # Group-only button — no DM equivalent, so don't fall back to a
+            # different session the presser happens to host elsewhere.
             s = find_session_by_chat(query.message.chat_id)
-            if not s:
-                s = find_player_session(user_id)
             if not s or user_id != s.host_id:
                 await query.answer("Host only.", show_alert=True)
                 return
@@ -1814,6 +1980,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 context.bot,
                 user_id,
                 positive=secrets.choice((True, False)),
+                use_assets=asset_mode_for_user(user_id),
                 reply_markup=get_keyboard(s, user_id),
             )
             return
@@ -1833,6 +2000,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await _send_guide_asset(
                 context.bot,
                 user_id,
+                use_assets=asset_mode_for_user(user_id),
                 reply_markup=get_keyboard(s, user_id),
             )
             return
@@ -1880,7 +2048,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.answer("Host only.", show_alert=True)
                 return
             await query.answer("Guide sent to group.")
-            await _send_guide_asset(context.bot, s.lobby_chat_id)
+            await _send_guide_asset(context.bot, s.lobby_chat_id, use_assets=_session_uses_assets(s))
             await _show_host_tools_panel(query, s, "info", "📖 Guide sent to the group.")
             return
 
@@ -1896,6 +2064,76 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode="HTML",
             )
             await _show_host_tools_panel(query, s, "info", "📜 Character list sent to the group.")
+            return
+
+        if data == "ht_toggle_assets":
+            s = find_host_session(user_id)
+            if not s or user_id != s.host_id:
+                await query.answer("Host only.", show_alert=True)
+                return
+            s.use_assets = _toggle_asset_mode(user_id, s)
+            save_lobby_state()
+            await query.answer("Asset mode updated.")
+            mode = "enabled" if s.use_assets else "text only"
+            await _show_host_tools_panel(
+                query,
+                s,
+                "info",
+                f"🖼 Asset replies are now <b>{mode}</b>.",
+            )
+            return
+
+        if data == "ht_pausegame":
+            s = find_host_session(user_id)
+            if not s or user_id != s.host_id:
+                await query.answer("Host only.", show_alert=True)
+                return
+            if not s.is_active():
+                await query.answer("Timer is only available during an active game.", show_alert=True)
+                return
+            if s.timer_paused:
+                await query.answer("Timer is already paused.", show_alert=True)
+                return
+            helpers.pause_game_timer(s)
+            await query.answer("Timer paused.")
+            await refresh_group_lobby(context.bot, s)
+            try:
+                await context.bot.send_message(
+                    chat_id=s.lobby_chat_id,
+                    text=(
+                        "⏸ <b>Timer paused.</b>\n\n"
+                        "No more trigger cards or reminders will advance until the host unpauses it."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await _show_host_tools_panel(query, s, "game", "⏸ Timer paused.")
+            return
+
+        if data == "ht_unpausegame":
+            s = find_host_session(user_id)
+            if not s or user_id != s.host_id:
+                await query.answer("Host only.", show_alert=True)
+                return
+            if not s.is_active():
+                await query.answer("Timer is only available during an active game.", show_alert=True)
+                return
+            if not s.timer_paused:
+                await query.answer("Timer is not paused.", show_alert=True)
+                return
+            helpers.resume_game_timer(s)
+            await query.answer("Timer resumed.")
+            await refresh_group_lobby(context.bot, s)
+            try:
+                await context.bot.send_message(
+                    chat_id=s.lobby_chat_id,
+                    text="▶️ <b>Timer resumed.</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await _show_host_tools_panel(query, s, "game", "▶️ Timer resumed.")
             return
 
         if data == "ht_send_sus_group":
@@ -2003,9 +2241,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # ── SUSPICION: show in group ──────────────────────────────────────
         if data == "sus_show_group":
-            s = find_session_by_chat(query.message.chat_id)
-            if not s:
+            # Also used as a private "Send Table to Group" host-tools button,
+            # so DM invocations need the find_player_session fallback; a group
+            # invocation must stay scoped to that group's own session.
+            if query.message.chat.type == "private":
                 s = find_player_session(user_id)
+            else:
+                s = find_session_by_chat(query.message.chat_id)
             if not s:
                 await query.answer("No game found.", show_alert=True)
                 return
@@ -2021,20 +2263,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         if data == "group_guide":
+            # Group-only button — no DM equivalent, so don't fall back to a
+            # different session the presser happens to host elsewhere.
             s = find_session_by_chat(query.message.chat_id)
-            if not s:
-                s = find_player_session(user_id)
             if not s:
                 await query.answer("No game found.", show_alert=True)
                 return
             await query.answer()
-            await _send_guide_asset(context.bot, s.lobby_chat_id)
+            await _send_guide_asset(context.bot, s.lobby_chat_id, use_assets=_session_uses_assets(s))
             return
 
         if data == "group_help":
             s = find_session_by_chat(query.message.chat_id)
-            if not s:
-                s = find_player_session(user_id)
             if not s:
                 await query.answer("No game found.", show_alert=True)
                 return
@@ -2335,6 +2575,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 context.bot,
                 user_id,
                 positive=secrets.choice((True, False)),
+                use_assets=asset_mode_for_user(user_id),
             )
             return
 
@@ -2700,14 +2941,14 @@ async def _apply_name(user, s: GameSession, new_name: str, context, reply_msg, p
 
     if user.id != s.host_id and not s.started:
         try:
-            await context.bot.send_message(
-                chat_id=s.host_id,
-                text=(
-                    f"✅ <b>{html.escape(user.first_name or str(user.id))}</b> is ready as "
-                    f"<i>{html.escape(new_name)}</i>"
-                ),
-                parse_mode="HTML",
-            )
+                await context.bot.send_message(
+                    chat_id=s.host_id,
+                    text=(
+                        f"✅ <b>{html.escape(helpers.display_name_for_user(user) or str(user.id))}</b> is ready as "
+                        f"<i>{html.escape(new_name)}</i>"
+                    ),
+                    parse_mode="HTML",
+                )
         except Exception:
             pass
 
@@ -2743,7 +2984,7 @@ async def _do_join(user, game_id: str, context, reply_msg, is_private: bool) -> 
         return
 
     s.players[user.id] = PlayerState(
-        telegram_name=user.first_name or "Player",
+        telegram_name=helpers.display_name_for_user(user),
         telegram_id=user.id,
         username=user.username or "",
     )
@@ -2773,7 +3014,7 @@ async def _do_join(user, game_id: str, context, reply_msg, is_private: bool) -> 
 
     await refresh_group_lobby(context.bot, s)
     save_lobby_state()
-    logger.info("%s joined game %s", user.first_name, game_id)
+    logger.info("%s joined game %s", helpers.display_name_for_user(user), game_id)
 
 
 async def _show_player_pick(user_id: int, s: GameSession, reply_msg, context) -> None:
@@ -2890,112 +3131,9 @@ async def _start_game_session(s: GameSession, context) -> tuple[bool, str]:
 
     s.started = True
     s.start_time = _now()
-    s.triggers_paused = False
-    s.final_timer_prompt_sent = False
-    save_lobby_state()
-
-    pids = list(s.players.keys())
-    shuffled_secrets = random.sample(PLAYER_SECRETS, k=min(len(pids), len(PLAYER_SECRETS)))
-    for i, pid in enumerate(pids):
-        if not s.players[pid].secret:
-            s.players[pid].secret = shuffled_secrets[i % len(shuffled_secrets)]
-
-    start_dm_tasks = [
-        asyncio.create_task(_send_start_dm(context, s, pid))
-        for pid in pids
-        if pid >= 0
-    ]
-    if start_dm_tasks:
-        await asyncio.gather(*start_dm_tasks, return_exceptions=True)
-
-    s.trigger_task = asyncio.create_task(game_trigger_scheduler(s, context.bot))
-    s.reminder_task = asyncio.create_task(group_reminder_loop(s, context.bot))
-
-    await refresh_group_lobby(context.bot, s)
-    try:
-        await context.bot.send_message(
-            chat_id=s.lobby_chat_id,
-            text=(
-                f"🎬 <b>Alice Is Missing is LIVE!</b>\n\n"
-                f"Secrets have been sent to each player in DM.\n"
-                f"Trigger cards will arrive throughout.\n"
-                f"You have 95 minutes. Good luck."
-            ),
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
-    logger.info("Game %s started with %d players", s.game_id, len(pids))
-    return True, ""
-def _telegram_dm_url(username: str) -> str | None:
-    username = (username or "").lstrip("@")
-    if not username:
-        return None
-    return f"https://t.me/{username}"
-
-
-def _character_list_dm_markup(s: GameSession, uid: int) -> InlineKeyboardMarkup | None:
-    rows = []
-    if uid in s.players:
-        ps = s.players[uid]
-        label = ps.character_name if ps.character_name != "Awaiting name" else ps.telegram_name
-        rows.append([InlineKeyboardButton(f"✏️ {label[:44]} (you)", callback_data="self_rename")])
-    if uid == s.host_id:
-        for pid, ps in s.players.items():
-            if pid < 0 or pid == uid:
-                continue
-            label = ps.character_name if ps.character_name != "Awaiting name" else ps.telegram_name
-            rows.append([InlineKeyboardButton(f"✏️ {label[:44]}", callback_data=f"host_rename_pick:{pid}")])
-        for idx, npc_name in enumerate(s.npc_names):
-            rows.append([InlineKeyboardButton(f"🎭 ✏️ {npc_name[:40]}", callback_data=f"host_rename_npc:{idx}")])
-        rows.append([InlineKeyboardButton("➕ Add NPC", callback_data="add_npc_dm")])
-    return InlineKeyboardMarkup(rows) if rows else None
-
-
-async def _send_start_dm(context, s: GameSession, pid: int) -> None:
-    ps = s.players[pid]
-    try:
-        await context.bot.send_chat_action(chat_id=pid, action=ChatAction.TYPING)
-        await context.bot.send_message(
-            chat_id=pid,
-            text=(
-                f"🎬 <b>The game begins.</b>\n\n"
-                f"You are <b>{html.escape(ps.character_name)}</b>.\n\n"
-                f"🤫 <b>Your Secret:</b>\n<i>{html.escape(ps.secret)}</i>\n\n"
-                f"Trigger cards will arrive throughout the game.\n"
-                f"Stay in character. Act on what you receive."
-            ),
-            parse_mode="HTML",
-            reply_markup=get_keyboard(s, pid),
-        )
-    except Exception as e:
-        logger.warning("Could not send start message to %s: %s", ps.telegram_name, e)
-
-
-async def _start_game_session(s: GameSession, context) -> tuple[bool, str]:
-    if s.started or s.ended:
-        return False, "Game already started or ended."
-
-    pending = s.pending_real_players()
-    if pending:
-        names = ", ".join(html.escape(s.players[p].telegram_name) for p in pending)
-        return False, f"Waiting for character names from: {names}"
-
-    real_count = sum(1 for uid in s.players if uid >= 0)
-    min_players = 1 if s.host_id in dev_mode_users else 2
-    if real_count < min_players:
-        return False, f"Need at least {min_players} player(s) to start."
-
-    if s.host_id in dev_mode_users:
-        for did, (dname, dsecret) in DUMMY_PLAYERS.items():
-            if did not in s.players:
-                ps = PlayerState(telegram_name=dname, character_name=dname, telegram_id=did)
-                ps.secret = dsecret
-                s.players[did] = ps
-
-    s.started = True
-    s.start_time = _now()
+    s.paused_seconds = 0.0
+    s.pause_started_at = None
+    s.timer_paused = False
     s.triggers_paused = False
     s.final_timer_prompt_sent = False
     save_lobby_state()
