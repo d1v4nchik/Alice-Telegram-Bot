@@ -34,8 +34,23 @@ pending_sus_char: dict[int, str] = {}
 pending_host_rename: dict[int, tuple[str, str, str]] = {}
 
 dev_mode_users: set[int] = set()
+asset_preferences: dict[int, bool] = {}
 
 _LOBBY_STATE_FILE = "lobby_state.json"
+
+
+def display_name_for_user(user) -> str:
+    """Return a stable human-readable name for a Telegram user."""
+    full_name = getattr(user, "full_name", "") or " ".join(
+        part for part in [getattr(user, "first_name", ""), getattr(user, "last_name", "")]
+        if part
+    ).strip()
+    if full_name:
+        return full_name
+    username = getattr(user, "username", "") or ""
+    if username:
+        return f"@{username}"
+    return "Host"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,15 +87,64 @@ def find_session_by_chat(chat_id: int) -> GameSession | None:
     return None
 
 
+def display_host_name(s: GameSession) -> str:
+    """Human-readable host name, normalizing the legacy "Group" sentinel value."""
+    host_name = s.host_telegram_name or "Host"
+    if host_name == "Group":
+        host_name = "Host"
+    return host_name
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Lobby state persistence
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def asset_mode_for_user(uid: int, default: bool = True) -> bool:
+    return asset_preferences.get(uid, default)
+
+
+def set_asset_mode_for_user(uid: int, enabled: bool) -> None:
+    asset_preferences[uid] = bool(enabled)
+
+
+def pause_game_timer(s: GameSession) -> bool:
+    """Pause a running session timer."""
+    if not s.started or s.ended or s.timer_paused:
+        return False
+    s.timer_paused = True
+    s.pause_started_at = datetime.now(tz=UTC)
+    save_lobby_state()
+    return True
+
+
+def resume_game_timer(s: GameSession) -> bool:
+    """Resume a paused session timer."""
+    if not s.started or s.ended or not s.timer_paused:
+        return False
+    now = datetime.now(tz=UTC)
+    pst = s.pause_started_at
+    if pst is not None:
+        if pst.tzinfo is None:
+            pst = pst.replace(tzinfo=UTC)
+        s.paused_seconds = max(0.0, float(s.paused_seconds or 0.0) + max(0.0, (now - pst).total_seconds()))
+    s.timer_paused = False
+    s.pause_started_at = None
+    save_lobby_state()
+    return True
+
 
 def save_lobby_state() -> None:
     """Persist game state to disk (best-effort)."""
     import json
     try:
-        data = {}
+        data = {
+            "__meta__": {
+                "asset_preferences": {
+                    str(uid): enabled for uid, enabled in asset_preferences.items()
+                }
+            }
+        }
         for gid, s in games.items():
             if s.ended:
                 continue
@@ -112,14 +176,21 @@ def save_lobby_state() -> None:
                 "started": s.started,
                 "ended": s.ended,
                 "start_time": st_str,
+                "paused_seconds": s.paused_seconds,
+                "pause_started_at": s.pause_started_at.isoformat() if s.pause_started_at else None,
+                "timer_paused": s.timer_paused,
                 "lobby_msg_id": s.lobby_msg_id,
                 "lobby_pinned": s.lobby_pinned,
                 "sus_points": s.sus_points,
+                "use_assets": s.use_assets,
                 "triggers_paused": s.triggers_paused,
                 "final_timer_prompt_sent": s.final_timer_prompt_sent,
             }
-        with open(_LOBBY_STATE_FILE, "w") as f:
+        import os
+        tmp_path = f"{_LOBBY_STATE_FILE}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, _LOBBY_STATE_FILE)
     except Exception as e:
         logger.warning("Failed to save lobby state: %s", e)
 
@@ -130,58 +201,95 @@ def load_lobby_state() -> None:
     try:
         with open(_LOBBY_STATE_FILE) as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        asset_preferences.clear()
+        meta = data.get("__meta__", {})
+        raw_asset_preferences = meta.get("asset_preferences", {})
+        if isinstance(raw_asset_preferences, dict):
+            for uid_str, enabled in raw_asset_preferences.items():
+                try:
+                    asset_preferences[int(uid_str)] = bool(enabled)
+                except (TypeError, ValueError):
+                    continue
         seen_lobby_chats: set[int] = set()
         seen_hosts: set[int] = set()
         for gid, raw in data.items():
-            lobby_chat_id = int(raw["lobby_chat_id"])
-            host_id = int(raw["host_id"])
-            if lobby_chat_id in seen_lobby_chats or host_id in seen_hosts:
-                logger.warning(
-                    "Skipping duplicate loaded session %s for chat %s / host %s",
-                    gid, lobby_chat_id, host_id,
-                )
+            if gid == "__meta__" or not isinstance(raw, dict):
                 continue
-            players = {}
-            for uid_str, pd in raw["players"].items():
-                uid = int(uid_str)
-                ps = PlayerState(
-                    telegram_name=pd["telegram_name"],
-                    telegram_id=pd["telegram_id"],
-                    username=pd.get("username", ""),
-                    character_name=pd.get("character_name", "Awaiting name"),
-                    secret=pd.get("secret", ""),
-                    notes=pd.get("notes", []),
-                    triggers_sent=pd.get("triggers_sent", 0),
+            try:
+                lobby_chat_id = int(raw["lobby_chat_id"])
+                host_id = int(raw["host_id"])
+                if lobby_chat_id in seen_lobby_chats or host_id in seen_hosts:
+                    logger.warning(
+                        "Skipping duplicate loaded session %s for chat %s / host %s",
+                        gid, lobby_chat_id, host_id,
+                    )
+                    continue
+                players = {}
+                for uid_str, pd in raw["players"].items():
+                    uid = int(uid_str)
+                    ps = PlayerState(
+                        telegram_name=pd["telegram_name"],
+                        telegram_id=pd["telegram_id"],
+                        username=pd.get("username", ""),
+                        character_name=pd.get("character_name", "Awaiting name"),
+                        secret=pd.get("secret", ""),
+                        notes=pd.get("notes", []),
+                        triggers_sent=pd.get("triggers_sent", 0),
+                    )
+                    players[uid] = ps
+
+                # Ensure start_time is always timezone-aware
+                start_time = None
+                if raw.get("start_time"):
+                    st = datetime.fromisoformat(raw["start_time"])
+                    if st.tzinfo is None:
+                        st = st.replace(tzinfo=UTC)
+                    start_time = st
+
+                pause_started_at = None
+                if raw.get("pause_started_at"):
+                    pst = datetime.fromisoformat(raw["pause_started_at"])
+                    if pst.tzinfo is None:
+                        pst = pst.replace(tzinfo=UTC)
+                    pause_started_at = pst
+
+                s = GameSession(
+                    game_id=raw["game_id"],
+                    host_id=host_id,
+                    lobby_chat_id=lobby_chat_id,
+                    host_telegram_name=raw.get("host_telegram_name", ""),
+                    players=players,
+                    npc_names=raw.get("npc_names", []),
+                    started=raw.get("started", False),
+                    ended=raw.get("ended", False),
+                    start_time=start_time,
+                    paused_seconds=float(raw.get("paused_seconds", 0.0) or 0.0),
+                    pause_started_at=pause_started_at,
+                    timer_paused=raw.get("timer_paused", False),
+                    lobby_msg_id=raw.get("lobby_msg_id"),
+                    lobby_pinned=raw.get("lobby_pinned", False),
+                    sus_points=raw.get("sus_points", {}),
+                    use_assets=raw.get("use_assets", True),
+                    triggers_paused=raw.get("triggers_paused", False),
+                    final_timer_prompt_sent=raw.get("final_timer_prompt_sent", False),
                 )
-                players[uid] = ps
-
-            # Ensure start_time is always timezone-aware
-            start_time = None
-            if raw.get("start_time"):
-                st = datetime.fromisoformat(raw["start_time"])
-                if st.tzinfo is None:
-                    st = st.replace(tzinfo=UTC)
-                start_time = st
-
-            s = GameSession(
-                game_id=raw["game_id"],
-                host_id=host_id,
-                lobby_chat_id=lobby_chat_id,
-                host_telegram_name=raw.get("host_telegram_name", ""),
-                players=players,
-                npc_names=raw.get("npc_names", []),
-                started=raw.get("started", False),
-                ended=raw.get("ended", False),
-                start_time=start_time,
-                lobby_msg_id=raw.get("lobby_msg_id"),
-                lobby_pinned=raw.get("lobby_pinned", False),
-                sus_points=raw.get("sus_points", {}),
-                triggers_paused=raw.get("triggers_paused", False),
-                final_timer_prompt_sent=raw.get("final_timer_prompt_sent", False),
-            )
-            games[gid] = s
-            seen_lobby_chats.add(lobby_chat_id)
-            seen_hosts.add(host_id)
+                if not s.host_telegram_name or s.host_telegram_name == "Group":
+                    host_player = s.players.get(s.host_id)
+                    if host_player and host_player.telegram_name and host_player.telegram_name != "Group":
+                        s.host_telegram_name = host_player.telegram_name
+                    else:
+                        s.host_telegram_name = "Host"
+                if not s.started:
+                    s.timer_paused = False
+                    s.pause_started_at = None
+                games[gid] = s
+                seen_lobby_chats.add(lobby_chat_id)
+                seen_hosts.add(host_id)
+            except Exception as e:
+                logger.warning("Skipping malformed loaded session %s: %s", gid, e)
+                continue
         logger.info("Loaded %d game(s) from state file.", len(games))
     except FileNotFoundError:
         pass
@@ -226,12 +334,13 @@ def _lobby_keyboard(s: GameSession) -> InlineKeyboardMarkup:
 
 
 def _lobby_text(s: GameSession) -> str:
+    host_name = display_host_name(s)
     if s.is_lobby():
         real_count = sum(1 for uid in s.players if uid >= 0)
         return (
             f"🎮 <b>Alice Is Missing</b>\n"
             f"<b>Game ID:</b> <code>{s.game_id}</code>\n"
-            f"<b>Host:</b> {html.escape(s.host_telegram_name)}\n"
+            f"<b>Host:</b> {html.escape(host_name)}\n"
             f"<b>Status:</b> 🏠 Lobby ({real_count} player(s))\n\n"
             f"{s.roster_text()}\n\n"
             f"Tap <b>Join</b> to enter, then DM the bot to set your character name."
@@ -239,10 +348,11 @@ def _lobby_text(s: GameSession) -> str:
     elif s.is_active():
         elapsed = int(s.elapsed_minutes())
         remaining = int(s.remaining_minutes())
+        pause_note = " · paused" if getattr(s, "timer_paused", False) else ""
         return (
             f"🎬 <b>Alice Is Missing — LIVE</b>\n"
             f"<b>Game ID:</b> <code>{s.game_id}</code>\n"
-            f"<b>Phase:</b> {s.game_phase().capitalize()} · {elapsed} min elapsed · {remaining} min left\n\n"
+            f"<b>Phase:</b> {s.game_phase().capitalize()}{pause_note} · {elapsed} min elapsed · {remaining} min left\n\n"
             f"{s.roster_text()}\n\n"
             f"The story is unfolding. Stay in character."
         )
@@ -305,6 +415,8 @@ async def end_game(s: GameSession, bot: Bot, reason: str = "host", purge: bool =
 
     s.ended = True
     s.end_time = datetime.now(tz=UTC)
+    s.timer_paused = False
+    s.pause_started_at = None
     clear_session_runtime_state(s)
 
     current_task = asyncio.current_task()
@@ -404,11 +516,13 @@ async def game_trigger_scheduler(s: GameSession, bot: Bot) -> None:
 
     try:
         while not s.ended:
-            if s.triggers_paused:
-                return
-            now = datetime.now(tz=UTC)
             if not s.start_time:
                 await asyncio.sleep(1)
+                continue
+            if s.triggers_paused:
+                return
+            if s.timer_paused:
+                await asyncio.sleep(2)
                 continue
 
             active_player_ids = [
@@ -422,8 +536,8 @@ async def game_trigger_scheduler(s: GameSession, bot: Bot) -> None:
             for uid in active_player_ids:
                 if s.ended:
                     return
-                if s.triggers_paused:
-                    return
+                if s.timer_paused:
+                    break
                 if uid in s.trigger_inflight:
                     continue
                 ps = s.players.get(uid)
@@ -431,8 +545,9 @@ async def game_trigger_scheduler(s: GameSession, bot: Bot) -> None:
                     continue
 
                 trigger_index = ps.triggers_sent + 1
-                due_at = s.start_time + timedelta(seconds=interval * trigger_index)
-                if now < due_at:
+                due_minutes = (interval * trigger_index) / 60.0
+                elapsed = s.elapsed_minutes()
+                if elapsed < due_minutes:
                     continue
 
                 phase = s.game_phase()
@@ -458,6 +573,7 @@ async def game_trigger_scheduler(s: GameSession, bot: Bot) -> None:
                     )
                     ps.triggers_sent += 1
                     pending.add(trigger)
+                    save_lobby_state()
                     logger.info(
                         "Sent trigger %d to %s (game %s)",
                         ps.triggers_sent,
@@ -470,12 +586,12 @@ async def game_trigger_scheduler(s: GameSession, bot: Bot) -> None:
                     s.trigger_inflight.discard(uid)
 
             if not progress_made:
-                await asyncio.sleep(2)
+                await asyncio.sleep(2 if not s.timer_paused else 1)
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.exception("Trigger loop error for uid %d: %s", uid, e)
+        logger.exception("Trigger loop error for game %s: %s", s.game_id, e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,6 +608,9 @@ async def group_reminder_loop(s: GameSession, bot: Bot) -> None:
     sent_marks: set[object] = set()
     try:
         while not s.ended:
+            if s.timer_paused:
+                await asyncio.sleep(2)
+                continue
             elapsed = s.elapsed_minutes()
 
             for idx, (due_minute, text) in enumerate(schedule):

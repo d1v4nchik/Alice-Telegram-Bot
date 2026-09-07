@@ -121,6 +121,8 @@ def host_tools_inline(session, menu: str = "main") -> InlineKeyboardMarkup:
     """Host-only tools inline menu, split into smaller focused panels."""
     is_lobby = bool(session and session.is_lobby())
     is_active = bool(session and session.is_active())
+    timer_paused = bool(getattr(session, "timer_paused", False))
+    use_assets = True if session is None else getattr(session, "use_assets", True)
 
     if menu == "main":
         return InlineKeyboardMarkup([
@@ -135,6 +137,13 @@ def host_tools_inline(session, menu: str = "main") -> InlineKeyboardMarkup:
         if is_lobby:
             rows.append([InlineKeyboardButton("▶️ Start Game", callback_data="ht_startgame")])
         if is_lobby or is_active:
+            if is_active:
+                rows.append([
+                    InlineKeyboardButton(
+                        "▶️ Unpause Timer" if timer_paused else "⏸ Pause Timer",
+                        callback_data="ht_unpausegame" if timer_paused else "ht_pausegame",
+                    )
+                ])
             rows.append([InlineKeyboardButton("🛑 End Game", callback_data="game_end_confirm")])
         rows.append([InlineKeyboardButton("⛔ Force Stop Bot", callback_data="ht_force_stop")])
         rows.append([InlineKeyboardButton("↩ Back", callback_data="ht_back")])
@@ -148,9 +157,11 @@ def host_tools_inline(session, menu: str = "main") -> InlineKeyboardMarkup:
         ])
 
     if menu == "info":
+        assets_label = "🖼 Disable Assets" if use_assets else "🖼 Enable Assets"
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📖 Send Guide to Group", callback_data="ht_send_guide")],
             [InlineKeyboardButton("📜 Send Character List to Group", callback_data="ht_send_charlist")],
+            [InlineKeyboardButton(assets_label, callback_data="ht_toggle_assets")],
             [InlineKeyboardButton("↩ Back", callback_data="ht_back")],
         ])
 

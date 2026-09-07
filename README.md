@@ -12,7 +12,7 @@ An unofficial Telegram adaptation of the silent mystery roleplaying game *Alice 
 
 This is a text-only story game for a group chat and private DMs.
 
-- One player hosts the game from the group.
+- The group creator hosts the game from the group.
 - Players join from the lobby, set their character names, and stay in character.
 - The bot sends secrets, clue card reminders and prompts over the course of the session.
 - Suspicion points, notes, and private messages help shape the story as it unfolds.
@@ -21,7 +21,7 @@ This is a text-only story game for a group chat and private DMs.
 
 [Full Game Guide](https://docs.google.com/document/d/e/2PACX-1vSFwZrJL02xuBbWOm5THFvpRCR4KFh9t9-J60gEZHJt8LPJ0kEktHfuFCN7ANnQqWkkBLXavoSLGSDS/pub)
 
-1. The host creates a lobby with `/newgame`.
+1. The group creator creates a lobby with `/newgame`.
 2. Players join from the pinned group card.
 3. Each player sets a character name in DM.
 4. The host starts the game with `/startgame`.
@@ -74,7 +74,7 @@ The bot will run as long as your terminal is open. Press `Control+C` to stop it.
 
 ### Group
 
-- `/newgame` - Create a new lobby
+- `/newgame` - Create a new lobby (group creator only)
 - `/characterlist` - Show the roster
 - `/showsus` - Show suspicion points
 - `/status` - Show the current game state

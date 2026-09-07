@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import fcntl
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
@@ -27,6 +28,7 @@ from alice_handlers import (
     cmd_help,
     cmd_guide,
     cmd_dev,
+    cmd_usepic,
     cmd_newgame,
     cmd_join,
     cmd_name,
@@ -41,6 +43,8 @@ from alice_handlers import (
     cmd_endgame,
     cmd_forcestop,
     cmd_startgame,
+    cmd_pausegame,
+    cmd_unpausegame,
     cmd_notes,
     cmd_sus,
     cmd_addnpc,
@@ -72,6 +76,30 @@ if _restore_active_sessions is None:
         return
 else:
     restore_active_sessions = _restore_active_sessions
+
+
+def _load_dotenv_file(path: Path | None = None) -> None:
+    """Load simple KEY=VALUE pairs from a local .env file if present."""
+    env_path = path or Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def _acquire_single_instance() -> None:
@@ -108,6 +136,7 @@ def _release_lock() -> None:
 
 def main() -> None:
     _acquire_single_instance()
+    _load_dotenv_file()
 
     # Fix for Python 3.14 asyncio
     import asyncio
@@ -131,9 +160,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("guide", cmd_guide))
     app.add_handler(CommandHandler("dev", cmd_dev))
+    app.add_handler(CommandHandler("usepic", cmd_usepic))
 
     app.add_handler(CommandHandler("newgame", cmd_newgame))
     app.add_handler(CommandHandler("startgame", cmd_startgame))
+    app.add_handler(CommandHandler(["pausegame", "pause"], cmd_pausegame))
+    app.add_handler(CommandHandler(["unpausegame", "unpause"], cmd_unpausegame))
     app.add_handler(CommandHandler("endgame", cmd_endgame))
     app.add_handler(CommandHandler("forcestop", cmd_forcestop))
     app.add_handler(CommandHandler("status", cmd_status))
